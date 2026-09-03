@@ -9,8 +9,11 @@ from kazoo.exceptions import NoNodeError, NotEmptyError
 
 from ch_tools.chadmin.cli.zookeeper_group import zookeeper_group
 from ch_tools.chadmin.internal.zookeeper import (
+    _delete_candidates,
+    _DeleteOutcome,
     _DeleteProgress,
-    delete_nodes_transaction,
+    _path_delete_size,
+    _probe_subtree,
     delete_recursive,
 )
 
@@ -27,11 +30,24 @@ class FakeTransaction:
 
     def commit(self) -> list[Any]:
         self.zk.transaction_sizes.append(len(self.paths))
+        self.zk.transaction_paths.append(list(self.paths))
+        self.zk.before_transaction(self.paths)
+        if self.zk.fail_transactions:
+            self.zk.fail_transactions -= 1
+            return [NotEmptyError() for _ in self.paths]
+        staged_children = {
+            path: set(children) for path, children in self.zk.children.items()
+        }
         for path in self.paths:
-            if path not in self.zk.children:
+            if path not in staged_children:
                 return [NoNodeError() for _ in self.paths]
-            if self.zk.children[path]:
+            if staged_children[path]:
                 return [NotEmptyError() for _ in self.paths]
+
+            parent = os.path.dirname(path)
+            if parent in staged_children:
+                staged_children[parent].discard(os.path.basename(path))
+            del staged_children[path]
 
         for path in self.paths:
             self.zk.remove_leaf(path)
@@ -41,10 +57,17 @@ class FakeTransaction:
 class FakeZooKeeper:
     def __init__(self, children: dict[str, set[str]]) -> None:
         self.children = {path: set(names) for path, names in children.items()}
+        self.exists_calls: list[str] = []
         self.get_children_calls: list[str] = []
         self.transaction_sizes: list[int] = []
+        self.transaction_paths: list[list[str]] = []
+        self.fail_transactions = 0
+
+    def before_transaction(self, paths: list[str]) -> None:
+        pass
 
     def exists(self, path: str) -> Any:
+        self.exists_calls.append(path)
         if path not in self.children:
             return None
         return SimpleNamespace(children_count=len(self.children[path]))
@@ -75,64 +98,81 @@ class FakeZooKeeper:
         del self.children[path]
 
 
-class FixedResultTransaction:
-    def __init__(self, result: list[Any]) -> None:
-        self.result = result
+def test_probe_returns_complete_child_first_small_tree() -> None:
+    zk = FakeZooKeeper({"/root": {"leaf"}, "/root/leaf": set()})
 
-    def delete(self, path: str) -> None:
-        pass
+    result = _probe_subtree(zk, "/root")
 
-    def commit(self) -> list[Any]:
-        return self.result
+    assert result.postorder == ["/root/leaf", "/root"]
+    assert zk.get_children_calls == ["/root", "/root/leaf"]
 
 
-class ShrinkingRecursiveDeleteZooKeeper:
-    def __init__(self) -> None:
-        self.delete_attempts = 0
+def test_probe_stops_when_delete_bytes_exceed_limit() -> None:
+    zk = FakeZooKeeper({"/root": {"long-child-name"}, "/root/long-child-name": set()})
 
-    def transaction(self) -> FixedResultTransaction:
-        return FixedResultTransaction([NotEmptyError()])
+    with patch("ch_tools.chadmin.internal.zookeeper.MAX_MULTI_BYTES", 40):
+        result = _probe_subtree(zk, "/root")
 
-    def exists(self, path: str) -> Any:
-        return SimpleNamespace(children_count=4 - self.delete_attempts)
-
-    def delete(self, path: str, recursive: bool = False) -> None:
-        self.delete_attempts += 1
-        if self.delete_attempts <= 3:
-            raise NotEmptyError
+    assert result.postorder is None
+    assert result.children["/root"] == ["long-child-name"]
+    assert zk.get_children_calls == ["/root"]
 
 
-def test_small_fallback_resets_stagnation_when_child_count_decreases() -> None:
-    zk = ShrinkingRecursiveDeleteZooKeeper()
+def test_delete_candidates_reports_successful_transaction() -> None:
+    zk = FakeZooKeeper(
+        {"/root": {"first", "second"}, "/root/first": set(), "/root/second": set()}
+    )
+    progress = _DeleteProgress()
+
+    outcomes = _delete_candidates(zk, ["/root/first", "/root/second"], progress)
+
+    assert outcomes == [_DeleteOutcome.DELETED, _DeleteOutcome.DELETED]
+    assert progress == _DeleteProgress(deleted=2)
+    assert zk.transaction_sizes == [2]
+
+
+def test_delete_candidates_falls_back_to_individual_outcomes() -> None:
+    zk = FakeZooKeeper(
+        {
+            "/root": {"branch", "leaf"},
+            "/root/branch": {"grandchild"},
+            "/root/branch/grandchild": set(),
+            "/root/leaf": set(),
+        }
+    )
+    progress = _DeleteProgress()
+
+    with patch("ch_tools.chadmin.internal.zookeeper.logging") as mock_logging:
+        outcomes = _delete_candidates(zk, ["/root/leaf", "/root/branch"], progress)
+
+    assert outcomes == [_DeleteOutcome.DELETED, _DeleteOutcome.NOT_EMPTY]
+    assert progress == _DeleteProgress(deleted=1, not_empty=1)
+    assert zk.transaction_sizes == [2]
+    assert "/root/leaf" not in str(mock_logging.method_calls)
+    assert "/root/branch" not in str(mock_logging.method_calls)
+
+
+def test_delete_candidates_reports_absent_member() -> None:
+    zk = FakeZooKeeper({"/root": set()})
     progress = _DeleteProgress()
 
     with patch("ch_tools.chadmin.internal.zookeeper.logging"):
-        delete_nodes_transaction(zk, ["/root"], progress)
+        outcomes = _delete_candidates(zk, ["/root/missing"], progress)
 
-    assert zk.delete_attempts == 4
-    assert progress == _DeleteProgress(deleted=1)
-
-
-class MissingRecursiveDeleteZooKeeper:
-    def __init__(self) -> None:
-        self.delete_attempts = 0
-
-    def transaction(self) -> FixedResultTransaction:
-        return FixedResultTransaction([NoNodeError()])
-
-    def delete(self, path: str, recursive: bool = False) -> None:
-        self.delete_attempts += 1
-
-
-def test_small_fallback_counts_missing_transaction_target_as_absent() -> None:
-    zk = MissingRecursiveDeleteZooKeeper()
-    progress = _DeleteProgress()
-
-    with patch("ch_tools.chadmin.internal.zookeeper.logging"):
-        delete_nodes_transaction(zk, ["/missing"], progress)
-
-    assert zk.delete_attempts == 0
+    assert outcomes == [_DeleteOutcome.ABSENT]
     assert progress == _DeleteProgress(already_absent=1)
+
+
+def test_delete_candidates_skips_multi_for_oversized_singleton() -> None:
+    zk = FakeZooKeeper({"/root": {"leaf"}, "/root/leaf": set()})
+    progress = _DeleteProgress()
+
+    with patch("ch_tools.chadmin.internal.zookeeper.MAX_MULTI_BYTES", 1):
+        outcomes = _delete_candidates(zk, ["/root/leaf"], progress)
+
+    assert outcomes == [_DeleteOutcome.DELETED]
+    assert progress == _DeleteProgress(deleted=1)
+    assert zk.transaction_sizes == []
 
 
 def test_large_delete_does_not_read_each_leaf() -> None:
@@ -168,6 +208,46 @@ def test_large_delete_descends_only_into_nonempty_candidates() -> None:
 
     assert zk.children == {}
     assert zk.get_children_calls == ["/root", "/root/branch"]
+    branch_attempts = [
+        index
+        for index, paths in enumerate(zk.transaction_paths)
+        if "/root/branch" in paths
+    ]
+    grandchild_attempt = next(
+        index
+        for index, paths in enumerate(zk.transaction_paths)
+        if "/root/branch/grandchild" in paths
+    )
+    assert len(branch_attempts) == 2
+    assert branch_attempts[0] < grandchild_attempt < branch_attempts[1]
+
+
+def test_large_delete_batches_are_parent_local_and_bounded() -> None:
+    leaf_names = {f"leaf-{index}" for index in range(6)}
+    zk = FakeZooKeeper(
+        {
+            "/root": leaf_names,
+            **{f"/root/{leaf}": set() for leaf in leaf_names},
+        }
+    )
+
+    with (
+        patch("ch_tools.chadmin.internal.zookeeper.logging"),
+        patch("ch_tools.chadmin.internal.zookeeper.MAX_MULTI_OPS", 2),
+        patch("ch_tools.chadmin.internal.zookeeper.MAX_MULTI_BYTES", 100),
+    ):
+        delete_recursive(zk, ["/root"])
+
+    assert zk.children == {}
+    assert all(len(paths) <= 2 for paths in zk.transaction_paths)
+    assert all(
+        len({os.path.dirname(path) for path in paths}) == 1
+        for paths in zk.transaction_paths
+    )
+    assert all(
+        sum(_path_delete_size(path) for path in paths) <= 100
+        for paths in zk.transaction_paths
+    )
 
 
 def test_bounded_scan_does_not_queue_a_large_nested_directory() -> None:
@@ -184,20 +264,14 @@ def test_bounded_scan_does_not_queue_a_large_nested_directory() -> None:
     with (
         patch("ch_tools.chadmin.internal.zookeeper.logging"),
         patch(
-            "ch_tools.chadmin.internal.zookeeper.LARGE_RECURSIVE_DELETE_THRESHOLD",
+            "ch_tools.chadmin.internal.zookeeper.MAX_MULTI_OPS",
             3,
-        ),
-        patch(
-            "ch_tools.chadmin.internal.zookeeper.LARGE_RECURSIVE_DELETE_BATCH_SIZE",
-            2,
         ),
     ):
         delete_recursive(zk, ["/root"])
 
     assert zk.children == {}
     assert zk.get_children_calls == [
-        "/root",
-        "/root/branch",
         "/root",
         "/root/branch",
     ]
@@ -209,15 +283,13 @@ class RacingZooKeeper(FakeZooKeeper):
         self.continuous = continuous
         self.created = 0
 
-    def delete(self, path: str, recursive: bool = False) -> None:
-        should_race = path == "/root" and not self.children[path]
+    def before_transaction(self, paths: list[str]) -> None:
+        should_race = paths == ["/root"] and not self.children["/root"]
         if should_race and (self.continuous or self.created == 0):
             child = f"late-{self.created}"
             self.created += 1
-            self.children[path].add(child)
-            self.children[f"{path}/{child}"] = set()
-            raise NotEmptyError
-        super().delete(path, recursive)
+            self.children["/root"].add(child)
+            self.children[f"/root/{child}"] = set()
 
 
 def test_large_delete_retries_a_finite_creation_race() -> None:
@@ -238,7 +310,7 @@ def test_large_delete_retries_a_finite_creation_race() -> None:
     assert zk.get_children_calls == ["/root", "/root"]
 
 
-def test_large_delete_aborts_after_three_stagnant_windows() -> None:
+def test_large_delete_aborts_after_three_sweeps_with_continuous_writer() -> None:
     leaf_names = {f"leaf-{index}" for index in range(10_001)}
     zk = RacingZooKeeper(
         {
@@ -249,10 +321,11 @@ def test_large_delete_aborts_after_three_stagnant_windows() -> None:
     )
 
     with patch("ch_tools.chadmin.internal.zookeeper.logging") as mock_logging:
-        with pytest.raises(RuntimeError, match="does not converge"):
-            delete_recursive(zk, ["/root"])
+        with pytest.raises(RuntimeError, match="after 3 sweeps"):
+            delete_recursive(zk, ["/root"], max_sweeps=3)
 
-    assert zk.created == 4
+    assert zk.created == 3
+    assert zk.get_children_calls == ["/root", "/root", "/root"]
     mock_logging.error.assert_called_once()
 
 
@@ -269,38 +342,65 @@ def test_small_delete_does_not_select_large_algorithm() -> None:
 
     assert zk.children == {}
     assert zk.get_children_calls == ["/root", "/root/leaf"]
+    assert zk.transaction_paths == [["/root/leaf", "/root"]]
     assert not any(
         "Using large recursive" in call.args[0]
         for call in mock_logging.info.call_args_list
     )
 
 
-class AlwaysBusyRootZooKeeper(FakeZooKeeper):
-    def __init__(self, children: dict[str, set[str]]) -> None:
-        super().__init__(children)
-        self.root_delete_attempts = 0
+def test_failed_small_transaction_reuses_probe_in_large_mode() -> None:
+    zk = FakeZooKeeper({"/root": {"leaf"}, "/root/leaf": set()})
+    zk.fail_transactions = 1
 
-    def delete(self, path: str, recursive: bool = False) -> None:
-        if path == "/root":
-            self.root_delete_attempts += 1
-            raise NotEmptyError
-        super().delete(path, recursive)
+    with patch("ch_tools.chadmin.internal.zookeeper.logging") as mock_logging:
+        delete_recursive(zk, ["/root"])
+
+    assert zk.children == {}
+    assert zk.get_children_calls == ["/root", "/root/leaf"]
+    assert any(
+        "switching to large" in call.args[0]
+        for call in mock_logging.info.call_args_list
+    )
 
 
-def test_small_delete_does_not_retry_forever_with_a_busy_writer() -> None:
-    zk = AlwaysBusyRootZooKeeper(
+def test_failed_atomic_leaf_reuses_cached_empty_children() -> None:
+    zk = FakeZooKeeper({"/root": set()})
+    zk.fail_transactions = 1
+
+    with patch("ch_tools.chadmin.internal.zookeeper.logging"):
+        delete_recursive(zk, ["/root"])
+
+    assert zk.children == {}
+    assert zk.get_children_calls == ["/root"]
+
+
+def test_delete_timeout_stops_before_next_batch_and_checks_root() -> None:
+    zk = FakeZooKeeper(
         {
-            "/root": {"leaf"},
+            "/root": {"branch", "leaf"},
+            "/root/branch": {"grandchild"},
+            "/root/branch/grandchild": set(),
             "/root/leaf": set(),
         }
     )
 
-    with patch("ch_tools.chadmin.internal.zookeeper.logging"):
-        with pytest.raises(RuntimeError, match="does not converge"):
-            delete_recursive(zk, ["/root"])
+    with (
+        patch("ch_tools.chadmin.internal.zookeeper.logging"),
+        patch("ch_tools.chadmin.internal.zookeeper.MAX_MULTI_OPS", 2),
+        patch(
+            "ch_tools.chadmin.internal.zookeeper.monotonic",
+            side_effect=[0.0, 0.0, 0.0, 2.0],
+        ),
+        pytest.raises(RuntimeError, match="deadline"),
+    ):
+        delete_recursive(zk, ["/root"], max_sweeps=0, delete_timeout=1.0)
 
-    # First failure establishes the baseline; next three stagnant windows abort.
-    assert zk.root_delete_attempts == 4
+    assert "/root/leaf" not in zk.children
+    assert "/root/branch" in zk.children
+    assert zk.get_children_calls == ["/root"]
+    assert zk.transaction_paths == [["/root/branch", "/root/leaf"]]
+    assert zk.exists_calls[-1] == "/root"
 
 
 def test_large_delete_logs_algorithm_selection_and_completion() -> None:
@@ -318,6 +418,31 @@ def test_large_delete_logs_algorithm_selection_and_completion() -> None:
     messages = [call.args[0] for call in mock_logging.info.call_args_list]
     assert any("Using large recursive" in message for message in messages)
     assert any("completed" in message for message in messages)
+
+
+def test_large_delete_logs_aggregate_progress_without_candidate_names() -> None:
+    zk = FakeZooKeeper(
+        {
+            "/root": {"private-leaf-0", "private-leaf-1", "private-leaf-2"},
+            "/root/private-leaf-0": set(),
+            "/root/private-leaf-1": set(),
+            "/root/private-leaf-2": set(),
+        }
+    )
+
+    with (
+        patch("ch_tools.chadmin.internal.zookeeper.logging") as mock_logging,
+        patch("ch_tools.chadmin.internal.zookeeper.MAX_MULTI_OPS", 2),
+        patch(
+            "ch_tools.chadmin.internal.zookeeper.LARGE_RECURSIVE_DELETE_LOG_INTERVAL", 2
+        ),
+    ):
+        delete_recursive(zk, ["/root"])
+
+    messages = str(mock_logging.method_calls)
+    assert "in progress" in messages
+    assert "sweep" in messages
+    assert "private-leaf" not in messages
 
 
 class UnconfirmedDeletionZooKeeper(FakeZooKeeper):
@@ -417,7 +542,7 @@ PATHS = [PATH, "/clickhouse/task_queue/ddl/query/shards/replica3/executed"]
             ["delete", "--path", PATHS[0], "--path", PATHS[1]],
             "delete_zk_nodes",
             (PATHS,),
-            {},
+            {"max_sweeps": 3, "delete_timeout": None},
             id="delete",
         ),
     ],
@@ -448,3 +573,44 @@ def test_delete_command_rejects_multiple_paths() -> None:
 
     assert result.exit_code != 0
     assert "Got unexpected extra argument" in result.output
+
+
+def test_delete_command_forwards_sweep_and_deadline_options() -> None:
+    with patch(
+        "ch_tools.chadmin.cli.zookeeper_group.delete_zk_nodes"
+    ) as mock_delete_zk_nodes:
+        result = CliRunner().invoke(
+            zookeeper_group,
+            [
+                "delete",
+                "--max-sweeps",
+                "0",
+                "--delete-timeout",
+                "12.5",
+                PATH,
+            ],
+            obj={"config": {"loguru": {"handlers": {}}}},
+        )
+
+    assert result.exit_code == 0, result.output
+    mock_delete_zk_nodes.assert_called_once_with(
+        ANY, [PATH], max_sweeps=0, delete_timeout=12.5
+    )
+
+
+@pytest.mark.parametrize(
+    "option",
+    [
+        pytest.param(["--max-sweeps", "-1"], id="negative-sweeps"),
+        pytest.param(["--delete-timeout", "0"], id="zero-timeout"),
+        pytest.param(["--delete-timeout", "-1"], id="negative-timeout"),
+    ],
+)
+def test_delete_command_rejects_invalid_limits(option: list[str]) -> None:
+    result = CliRunner().invoke(
+        zookeeper_group,
+        ["delete", *option, PATH],
+        obj={"config": {"loguru": {"handlers": {}}}},
+    )
+
+    assert result.exit_code != 0
