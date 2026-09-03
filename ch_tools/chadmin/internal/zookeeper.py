@@ -10,7 +10,7 @@ import os
 import re
 from collections import deque
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from math import sqrt
 from typing import Any, Callable, Dict, Generator, Iterable, List, Optional, Set, Union
 
@@ -36,6 +36,27 @@ LARGE_RECURSIVE_DELETE_LOG_INTERVAL = 100_000
 class _DeleteProgress:
     deleted: int = 0
     already_absent: int = 0
+
+
+@dataclass
+class _DeletionConvergence:
+    minimum_children: Optional[int] = None
+    stagnant_windows: int = 0
+
+    def observe(self, path: str, remaining_children: int) -> None:
+        if self.minimum_children is None or remaining_children < self.minimum_children:
+            self.minimum_children = remaining_children
+            self.stagnant_windows = 0
+            return
+
+        self.stagnant_windows += 1
+        if self.stagnant_windows >= LARGE_RECURSIVE_DELETE_MAX_STAGNANT_WINDOWS:
+            raise RuntimeError(
+                f"Recursive deletion of {path} does not converge: "
+                f"{remaining_children} children remain after "
+                f"{self.stagnant_windows} non-decreasing windows. "
+                "Stop writers or increase deletion throughput."
+            )
 
 
 class ZKTransactionBuilder:
@@ -310,15 +331,12 @@ def find_leafs_and_nodes(
 def delete_nodes_transaction(
     zk: KazooClient,
     to_delete_in_trasaction: List[str],
-    progress: Optional[_DeleteProgress] = None,
+    progress: _DeleteProgress,
 ) -> None:
     """
     Perform deletion for the list of nodes in a single transaction.
     If the transaction fails, go through the list and delete the nodes one by one.
     """
-    if progress is None:
-        progress = _DeleteProgress()
-
     delete_transaction = zk.transaction()
     for node in to_delete_in_trasaction:
         delete_transaction.delete(node)
@@ -335,8 +353,18 @@ def delete_nodes_transaction(
         "Delete transaction have failed. Fallthrough to single delete operations for zk_nodes : {}",
         to_delete_in_trasaction,
     )
-    for node in to_delete_in_trasaction:
-        for _ in range(LARGE_RECURSIVE_DELETE_MAX_STAGNANT_WINDOWS):
+    for index, node in enumerate(to_delete_in_trasaction):
+        if index < len(result) and isinstance(result[index], NoNodeError):
+            progress.already_absent += 1
+            continue
+
+        stat = zk.exists(node)
+        if stat is None:
+            progress.already_absent += 1
+            continue
+
+        convergence = _DeletionConvergence()
+        while True:
             try:
                 zk.delete(node, recursive=True)
                 progress.deleted += 1
@@ -347,14 +375,11 @@ def delete_nodes_transaction(
                 progress.already_absent += 1
                 break
             except NotEmptyError:
-                # Someone created a node while we were deleting. Retry the snapshot.
-                continue
-        else:
-            raise RuntimeError(
-                f"Recursive deletion of {node} does not converge after "
-                f"{LARGE_RECURSIVE_DELETE_MAX_STAGNANT_WINDOWS} attempts. "
-                "Stop writers or increase deletion throughput."
-            )
+                stat = zk.exists(node)
+                if stat is None:
+                    progress.already_absent += 1
+                    break
+                convergence.observe(node, stat.children_count)
 
 
 def remove_subpaths(paths: List[str]) -> List[str]:
@@ -384,8 +409,7 @@ class _DeleteFrame:
     path: str
     children: Optional[List[str]] = None
     next_child: int = 0
-    minimum_remaining_children: Optional[int] = None
-    stagnant_windows: int = 0
+    convergence: _DeletionConvergence = field(default_factory=_DeletionConvergence)
 
 
 def _collect_nodes_up_to(
@@ -488,24 +512,7 @@ def _delete_large_tree(
                 stack.pop()
                 continue
 
-            remaining_children = stat.children_count
-            if (
-                frame.minimum_remaining_children is None
-                or remaining_children < frame.minimum_remaining_children
-            ):
-                frame.minimum_remaining_children = remaining_children
-                frame.stagnant_windows = 0
-            else:
-                frame.stagnant_windows += 1
-
-            if frame.stagnant_windows >= LARGE_RECURSIVE_DELETE_MAX_STAGNANT_WINDOWS:
-                raise RuntimeError(
-                    f"Recursive deletion of {frame.path} does not converge: "
-                    f"{remaining_children} children remain after "
-                    f"{frame.stagnant_windows} non-decreasing windows. "
-                    "Stop writers or increase deletion throughput."
-                )
-
+            frame.convergence.observe(frame.path, stat.children_count)
             frame.children = None
 
 

@@ -8,7 +8,11 @@ from click.testing import CliRunner
 from kazoo.exceptions import NoNodeError, NotEmptyError
 
 from ch_tools.chadmin.cli.zookeeper_group import zookeeper_group
-from ch_tools.chadmin.internal.zookeeper import delete_recursive
+from ch_tools.chadmin.internal.zookeeper import (
+    _DeleteProgress,
+    delete_nodes_transaction,
+    delete_recursive,
+)
 
 PATH = "/clickhouse/task_queue/ddl/query/shards/replica1:9440,replica2:9440/executed"
 
@@ -69,6 +73,66 @@ class FakeZooKeeper:
         if parent in self.children:
             self.children[parent].discard(os.path.basename(path))
         del self.children[path]
+
+
+class FixedResultTransaction:
+    def __init__(self, result: list[Any]) -> None:
+        self.result = result
+
+    def delete(self, path: str) -> None:
+        pass
+
+    def commit(self) -> list[Any]:
+        return self.result
+
+
+class ShrinkingRecursiveDeleteZooKeeper:
+    def __init__(self) -> None:
+        self.delete_attempts = 0
+
+    def transaction(self) -> FixedResultTransaction:
+        return FixedResultTransaction([NotEmptyError()])
+
+    def exists(self, path: str) -> Any:
+        return SimpleNamespace(children_count=4 - self.delete_attempts)
+
+    def delete(self, path: str, recursive: bool = False) -> None:
+        self.delete_attempts += 1
+        if self.delete_attempts <= 3:
+            raise NotEmptyError
+
+
+def test_small_fallback_resets_stagnation_when_child_count_decreases() -> None:
+    zk = ShrinkingRecursiveDeleteZooKeeper()
+    progress = _DeleteProgress()
+
+    with patch("ch_tools.chadmin.internal.zookeeper.logging"):
+        delete_nodes_transaction(zk, ["/root"], progress)
+
+    assert zk.delete_attempts == 4
+    assert progress == _DeleteProgress(deleted=1)
+
+
+class MissingRecursiveDeleteZooKeeper:
+    def __init__(self) -> None:
+        self.delete_attempts = 0
+
+    def transaction(self) -> FixedResultTransaction:
+        return FixedResultTransaction([NoNodeError()])
+
+    def delete(self, path: str, recursive: bool = False) -> None:
+        self.delete_attempts += 1
+
+
+def test_small_fallback_counts_missing_transaction_target_as_absent() -> None:
+    zk = MissingRecursiveDeleteZooKeeper()
+    progress = _DeleteProgress()
+
+    with patch("ch_tools.chadmin.internal.zookeeper.logging"):
+        delete_nodes_transaction(zk, ["/missing"], progress)
+
+    assert zk.delete_attempts == 0
+    assert progress == _DeleteProgress(already_absent=1)
 
 
 def test_large_delete_does_not_read_each_leaf() -> None:
@@ -235,7 +299,8 @@ def test_small_delete_does_not_retry_forever_with_a_busy_writer() -> None:
         with pytest.raises(RuntimeError, match="does not converge"):
             delete_recursive(zk, ["/root"])
 
-    assert zk.root_delete_attempts == 3
+    # First failure establishes the baseline; next three stagnant windows abort.
+    assert zk.root_delete_attempts == 4
 
 
 def test_large_delete_logs_algorithm_selection_and_completion() -> None:
