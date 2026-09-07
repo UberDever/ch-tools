@@ -11,7 +11,6 @@ import re
 from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from enum import Enum, auto
 from time import monotonic
 from typing import Any, Callable, Dict, Generator, Iterable, List, Optional, Set, Union
 
@@ -35,10 +34,15 @@ RECURSIVE_DELETE_DRY_RUN_MAX_LISTED_PATHS = 1_000
 
 
 @dataclass
-class _DeleteProgress:
+class _DeleteCounts:
     deleted: int = 0
     already_absent: int = 0
     not_empty: int = 0
+
+
+@dataclass
+class _DeleteProgress:
+    counts: _DeleteCounts = field(default_factory=_DeleteCounts)
     sweeps: int = 0
     retained_branches: int = 0
 
@@ -86,15 +90,10 @@ def _probe_subtree(
     return _ProbeResult(list(reversed(preorder)))
 
 
-class _DeleteOutcome(Enum):
-    DELETED = auto()
-    ABSENT = auto()
-    NOT_EMPTY = auto()
-
-
 def _delete_candidates(
-    zk: KazooClient, paths: List[str], progress: _DeleteProgress
-) -> List[_DeleteOutcome]:
+    zk: KazooClient, paths: List[str], counts: _DeleteCounts
+) -> List[int]:
+    """Update counts and return input indices of nonempty nodes."""
     if not paths:
         return []
 
@@ -108,27 +107,25 @@ def _delete_candidates(
             transaction.delete(path)
         result = transaction.commit()
         if len(result) == len(paths) and all(item is True for item in result):
-            progress.deleted += len(paths)
-            return [_DeleteOutcome.DELETED] * len(paths)
+            counts.deleted += len(paths)
+            return []
 
         logging.info(
             "Delete transaction failed; falling back to {} individual deletes",
             len(paths),
         )
 
-    outcomes = []
-    for path in paths:
+    not_empty_indices = []
+    for index, path in enumerate(paths):
         try:
             zk.delete(path)
-            progress.deleted += 1
-            outcomes.append(_DeleteOutcome.DELETED)
+            counts.deleted += 1
         except NoNodeError:
-            progress.already_absent += 1
-            outcomes.append(_DeleteOutcome.ABSENT)
+            counts.already_absent += 1
         except NotEmptyError:
-            progress.not_empty += 1
-            outcomes.append(_DeleteOutcome.NOT_EMPTY)
-    return outcomes
+            counts.not_empty += 1
+            not_empty_indices.append(index)
+    return not_empty_indices
 
 
 class ZKTransactionBuilder:
@@ -487,34 +484,27 @@ def _take_child_batch(
     return batch, index
 
 
-def _record_ready_outcomes(frame: _DeleteFrame, outcomes: List[_DeleteOutcome]) -> int:
-    retained = sum(outcome is _DeleteOutcome.NOT_EMPTY for outcome in outcomes)
-    if retained:
-        frame.retained = True
-    return retained
-
-
 def _delete_candidates_with_progress_log(
     zk: KazooClient,
     root_path: str,
     paths: List[str],
     progress: _DeleteProgress,
-) -> List[_DeleteOutcome]:
-    deleted_before = progress.deleted
-    outcomes = _delete_candidates(zk, paths, progress)
+) -> List[int]:
+    deleted_before = progress.counts.deleted
+    not_empty_indices = _delete_candidates(zk, paths, progress.counts)
     if (
-        progress.deleted // LARGE_RECURSIVE_DELETE_LOG_INTERVAL
+        progress.counts.deleted // LARGE_RECURSIVE_DELETE_LOG_INTERVAL
         > deleted_before // LARGE_RECURSIVE_DELETE_LOG_INTERVAL
     ):
         logging.info(
             "Large recursive ZooKeeper deletion of {} is in progress: "
             "deleted={}, already_absent={}, not_empty={}",
             root_path,
-            progress.deleted,
-            progress.already_absent,
-            progress.not_empty,
+            progress.counts.deleted,
+            progress.counts.already_absent,
+            progress.counts.not_empty,
         )
-    return outcomes
+    return not_empty_indices
 
 
 def _delete_sweep(
@@ -542,10 +532,12 @@ def _delete_sweep(
             continue
 
         if frame.ready:
-            outcomes = _delete_candidates_with_progress_log(
+            not_empty_indices = _delete_candidates_with_progress_log(
                 zk, root_path, frame.ready, progress
             )
-            retained_branches += _record_ready_outcomes(frame, outcomes)
+            if not_empty_indices:
+                frame.retained = True
+            retained_branches += len(not_empty_indices)
             frame.ready = []
             continue
 
@@ -553,14 +545,10 @@ def _delete_sweep(
             batch, frame.next_child = _take_child_batch(
                 frame.path, frame.children, frame.next_child
             )
-            outcomes = _delete_candidates_with_progress_log(
+            not_empty_indices = _delete_candidates_with_progress_log(
                 zk, root_path, batch, progress
             )
-            frame.to_expand.extend(
-                path
-                for path, outcome in zip(batch, outcomes)
-                if outcome is _DeleteOutcome.NOT_EMPTY
-            )
+            frame.to_expand.extend(batch[index] for index in not_empty_indices)
             continue
 
         stack.pop()
@@ -573,12 +561,10 @@ def _delete_sweep(
             stack[-1].ready.append(frame.path)
             continue
 
-        outcomes = _delete_candidates_with_progress_log(
+        not_empty_indices = _delete_candidates_with_progress_log(
             zk, root_path, [frame.path], progress
         )
-        retained_branches += sum(
-            outcome is _DeleteOutcome.NOT_EMPTY for outcome in outcomes
-        )
+        retained_branches += len(not_empty_indices)
 
     return retained_branches, False
 
@@ -592,7 +578,7 @@ def _delete_atomic(
     result = transaction.commit()
     if len(result) != len(paths) or not all(item is True for item in result):
         return False
-    progress.deleted += len(paths)
+    progress.counts.deleted += len(paths)
     return True
 
 
@@ -687,8 +673,8 @@ def delete_recursive(
                         "Recursive ZooKeeper deletion of {} completed: "
                         "deleted={}, already_absent={}",
                         root_path,
-                        progress.deleted,
-                        progress.already_absent,
+                        progress.counts.deleted,
+                        progress.counts.already_absent,
                     )
                     continue
                 logging.info(
@@ -720,9 +706,9 @@ def delete_recursive(
                     "deleted={}, already_absent={}, not_empty={}, retained={}",
                     sweeps,
                     root_path,
-                    progress.deleted,
-                    progress.already_absent,
-                    progress.not_empty,
+                    progress.counts.deleted,
+                    progress.counts.already_absent,
+                    progress.counts.not_empty,
                     retained,
                 )
                 if not root_exists:
@@ -744,9 +730,9 @@ def delete_recursive(
                 "Recursive ZooKeeper deletion of {} is incomplete: "
                 "deleted={}, already_absent={}, not_empty={}",
                 root_path,
-                progress.deleted,
-                progress.already_absent,
-                progress.not_empty,
+                progress.counts.deleted,
+                progress.counts.already_absent,
+                progress.counts.not_empty,
             )
             raise
 
@@ -754,9 +740,9 @@ def delete_recursive(
             "Recursive ZooKeeper deletion of {} completed: "
             "deleted={}, already_absent={}, not_empty={}, sweeps={}",
             root_path,
-            progress.deleted,
-            progress.already_absent,
-            progress.not_empty,
+            progress.counts.deleted,
+            progress.counts.already_absent,
+            progress.counts.not_empty,
             sweeps,
         )
 

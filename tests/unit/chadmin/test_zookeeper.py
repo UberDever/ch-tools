@@ -10,8 +10,7 @@ from kazoo.exceptions import NoNodeError, NotEmptyError
 from ch_tools.chadmin.cli.zookeeper_group import zookeeper_group
 from ch_tools.chadmin.internal.zookeeper import (
     _delete_candidates,
-    _DeleteOutcome,
-    _DeleteProgress,
+    _DeleteCounts,
     _path_delete_size,
     _probe_subtree,
     delete_recursive,
@@ -124,12 +123,14 @@ def test_delete_candidates_reports_successful_transaction() -> None:
     zk = FakeZooKeeper(
         {"/root": {"first", "second"}, "/root/first": set(), "/root/second": set()}
     )
-    progress = _DeleteProgress()
+    progress = _DeleteCounts()
 
-    outcomes = _delete_candidates(zk, ["/root/first", "/root/second"], progress)
+    not_empty_indices = _delete_candidates(
+        zk, ["/root/first", "/root/second"], progress
+    )
 
-    assert outcomes == [_DeleteOutcome.DELETED, _DeleteOutcome.DELETED]
-    assert progress == _DeleteProgress(deleted=2)
+    assert not_empty_indices == []
+    assert progress == _DeleteCounts(deleted=2)
     assert zk.transaction_sizes == [2]
 
 
@@ -142,41 +143,58 @@ def test_delete_candidates_falls_back_to_individual_outcomes() -> None:
             "/root/leaf": set(),
         }
     )
-    progress = _DeleteProgress()
+    progress = _DeleteCounts()
 
     with patch("ch_tools.chadmin.internal.zookeeper.logging") as mock_logging:
-        outcomes = _delete_candidates(zk, ["/root/leaf", "/root/branch"], progress)
+        not_empty_indices = _delete_candidates(
+            zk, ["/root/leaf", "/root/branch"], progress
+        )
 
-    assert outcomes == [_DeleteOutcome.DELETED, _DeleteOutcome.NOT_EMPTY]
-    assert progress == _DeleteProgress(deleted=1, not_empty=1)
+    assert not_empty_indices == [1]
+    assert progress == _DeleteCounts(deleted=1, not_empty=1)
     assert zk.transaction_sizes == [2]
     assert "/root/leaf" not in str(mock_logging.method_calls)
     assert "/root/branch" not in str(mock_logging.method_calls)
 
 
+def test_delete_candidates_preserves_counts_on_unexpected_failure() -> None:
+    zk = FakeZooKeeper({"/root": set()})
+    counts = _DeleteCounts()
+    zk.fail_transactions = 1
+
+    with (
+        patch("ch_tools.chadmin.internal.zookeeper.logging"),
+        patch.object(zk, "delete", side_effect=[None, RuntimeError("connection lost")]),
+        pytest.raises(RuntimeError, match="connection lost"),
+    ):
+        _delete_candidates(zk, ["/root/first", "/root/second"], counts)
+
+    assert counts == _DeleteCounts(deleted=1)
+
+
 def test_delete_candidates_reports_absent_member() -> None:
     zk = FakeZooKeeper({"/root": set()})
-    progress = _DeleteProgress()
+    progress = _DeleteCounts()
 
     with patch("ch_tools.chadmin.internal.zookeeper.logging"):
-        outcomes = _delete_candidates(zk, ["/root/missing"], progress)
+        not_empty_indices = _delete_candidates(zk, ["/root/missing"], progress)
 
-    assert outcomes == [_DeleteOutcome.ABSENT]
-    assert progress == _DeleteProgress(already_absent=1)
+    assert not_empty_indices == []
+    assert progress == _DeleteCounts(already_absent=1)
 
 
 def test_delete_candidates_skips_multi_for_oversized_singleton() -> None:
     zk = FakeZooKeeper({"/root": {"leaf"}, "/root/leaf": set()})
-    progress = _DeleteProgress()
+    progress = _DeleteCounts()
 
     with patch(
         "ch_tools.chadmin.internal.zookeeper." "RECURSIVE_DELETE_TRANSACTION_MAX_BYTES",
         1,
     ):
-        outcomes = _delete_candidates(zk, ["/root/leaf"], progress)
+        not_empty_indices = _delete_candidates(zk, ["/root/leaf"], progress)
 
-    assert outcomes == [_DeleteOutcome.DELETED]
-    assert progress == _DeleteProgress(deleted=1)
+    assert not_empty_indices == []
+    assert progress == _DeleteCounts(deleted=1)
     assert zk.transaction_sizes == []
 
 
