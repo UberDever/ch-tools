@@ -28,10 +28,10 @@ from ch_tools.common.clickhouse.config.clickhouse import ClickhouseConfig
 from ch_tools.common.utils import escape_for_file_name, unescape_for_file_name
 
 LARGE_RECURSIVE_DELETE_LOG_INTERVAL = 100_000
-MAX_MULTI_OPS = 1_000
-MAX_MULTI_BYTES = 512 * 1024
-DELETE_OP_OVERHEAD = 32
-DEFAULT_DELETE_MAX_SWEEPS = 3
+RECURSIVE_DELETE_TRANSACTION_MAX_OPS = 1_000
+RECURSIVE_DELETE_TRANSACTION_MAX_BYTES = 512 * 1024
+RECURSIVE_DELETE_OPERATION_OVERHEAD = 32
+RECURSIVE_DELETE_DRY_RUN_MAX_LISTED_PATHS = 1_000
 
 
 @dataclass
@@ -46,48 +46,44 @@ class _DeleteProgress:
 @dataclass
 class _ProbeResult:
     postorder: Optional[List[str]]
-    children: Dict[str, List[str]]
     deadline_reached: bool = False
 
 
 def _path_delete_size(path: str) -> int:
-    return len(path.encode("utf-8")) + DELETE_OP_OVERHEAD
-
-
-def _deadline_reached(deadline: Optional[float]) -> bool:
-    return deadline is not None and monotonic() >= deadline
+    return len(path.encode("utf-8")) + RECURSIVE_DELETE_OPERATION_OVERHEAD
 
 
 def _probe_subtree(
     zk: KazooClient, root_path: str, deadline: Optional[float] = None
 ) -> _ProbeResult:
     estimated_bytes = _path_delete_size(root_path)
-    if estimated_bytes > MAX_MULTI_BYTES:
-        return _ProbeResult(None, {})
+    if estimated_bytes > RECURSIVE_DELETE_TRANSACTION_MAX_BYTES:
+        return _ProbeResult(None)
 
     operation_count = 1
     preorder = []
     pending = [root_path]
-    cached_children: Dict[str, List[str]] = {}
 
     while pending:
-        if _deadline_reached(deadline):
-            return _ProbeResult(None, cached_children, deadline_reached=True)
+        if deadline is not None and monotonic() >= deadline:
+            return _ProbeResult(None, deadline_reached=True)
         path = pending.pop()
         preorder.append(path)
         children = get_children(zk, path)
-        cached_children[path] = children
         child_paths = []
         for child in children:
             child_path = os.path.join(path, child)
             operation_count += 1
             estimated_bytes += _path_delete_size(child_path)
-            if operation_count > MAX_MULTI_OPS or estimated_bytes > MAX_MULTI_BYTES:
-                return _ProbeResult(None, cached_children)
+            if (
+                operation_count > RECURSIVE_DELETE_TRANSACTION_MAX_OPS
+                or estimated_bytes > RECURSIVE_DELETE_TRANSACTION_MAX_BYTES
+            ):
+                return _ProbeResult(None)
             child_paths.append(child_path)
         pending.extend(reversed(child_paths))
 
-    return _ProbeResult(list(reversed(preorder)), cached_children)
+    return _ProbeResult(list(reversed(preorder)))
 
 
 class _DeleteOutcome(Enum):
@@ -103,7 +99,10 @@ def _delete_candidates(
         return []
 
     estimated_bytes = sum(_path_delete_size(path) for path in paths)
-    if len(paths) <= MAX_MULTI_OPS and estimated_bytes <= MAX_MULTI_BYTES:
+    if (
+        len(paths) <= RECURSIVE_DELETE_TRANSACTION_MAX_OPS
+        and estimated_bytes <= RECURSIVE_DELETE_TRANSACTION_MAX_BYTES
+    ):
         transaction = zk.transaction()
         for path in paths:
             transaction.delete(path)
@@ -318,7 +317,7 @@ def delete_zk_nodes(
     ctx: Context,
     paths: List[str],
     dry_run: bool = False,
-    max_sweeps: int = DEFAULT_DELETE_MAX_SWEEPS,
+    max_sweeps: int = 3,
     delete_timeout: Optional[float] = None,
 ) -> None:
     paths_formated = [format_path(ctx, path) for path in paths]
@@ -445,23 +444,25 @@ class _DeleteFrame:
     retained: bool = False
 
 
-def _collect_nodes_up_to(
-    zk: KazooClient, root_path: str, limit: Optional[int] = None
-) -> Optional[List[str]]:
-    nodes = []
-    queue = deque([root_path])
+def _walk_subtree_depth_first(
+    zk: KazooClient, root_path: str
+) -> Generator[str, None, None]:
+    """Yield paths without retaining every full path in a wide subtree."""
+    yield root_path
+    stack = [(root_path, get_children(zk, root_path), 0)]
 
-    while queue:
-        path = queue.popleft()
-        nodes.append(path)
-        if limit is not None and len(nodes) > limit:
-            return None
-        children = get_children(zk, path)
-        if limit is not None and len(nodes) + len(queue) + len(children) > limit:
-            return None
-        queue.extend(os.path.join(path, child_node) for child_node in children)
+    while stack:
+        parent, children, index = stack[-1]
+        if index == len(children):
+            stack.pop()
+            continue
 
-    return nodes
+        child_path = os.path.join(parent, children[index])
+        stack[-1] = (parent, children, index + 1)
+        yield child_path
+        child_nodes = get_children(zk, child_path)
+        if child_nodes:
+            stack.append((child_path, child_nodes, 0))
 
 
 def _take_child_batch(
@@ -470,15 +471,18 @@ def _take_child_batch(
     batch: List[str] = []
     estimated_bytes = 0
     index = start
-    while index < len(children) and len(batch) < MAX_MULTI_OPS:
+    while index < len(children) and len(batch) < RECURSIVE_DELETE_TRANSACTION_MAX_OPS:
         path = os.path.join(parent, children[index])
         path_size = _path_delete_size(path)
-        if batch and estimated_bytes + path_size > MAX_MULTI_BYTES:
+        if (
+            batch
+            and estimated_bytes + path_size > RECURSIVE_DELETE_TRANSACTION_MAX_BYTES
+        ):
             break
         batch.append(path)
         estimated_bytes += path_size
         index += 1
-        if estimated_bytes > MAX_MULTI_BYTES:
+        if estimated_bytes > RECURSIVE_DELETE_TRANSACTION_MAX_BYTES:
             break
     return batch, index
 
@@ -517,7 +521,6 @@ def _delete_sweep(
     zk: KazooClient,
     root_path: str,
     progress: _DeleteProgress,
-    cached_children: Dict[str, List[str]],
     deadline: Optional[float] = None,
 ) -> tuple[int, bool]:
     """Run one finite sweep; return retained branch count and deadline state."""
@@ -525,15 +528,13 @@ def _delete_sweep(
     retained_branches = 0
 
     while stack:
+        if deadline is not None and monotonic() >= deadline:
+            return retained_branches, True
+
         frame = stack[-1]
 
         if frame.children is None:
-            try:
-                frame.children = cached_children.pop(frame.path)
-            except KeyError:
-                if _deadline_reached(deadline):
-                    return retained_branches, True
-                frame.children = get_children(zk, frame.path)
+            frame.children = get_children(zk, frame.path)
             continue
 
         if frame.to_expand:
@@ -541,8 +542,6 @@ def _delete_sweep(
             continue
 
         if frame.ready:
-            if _deadline_reached(deadline):
-                return retained_branches, True
             outcomes = _delete_candidates_with_progress_log(
                 zk, root_path, frame.ready, progress
             )
@@ -551,8 +550,6 @@ def _delete_sweep(
             continue
 
         if frame.next_child < len(frame.children):
-            if _deadline_reached(deadline):
-                return retained_branches, True
             batch, frame.next_child = _take_child_batch(
                 frame.path, frame.children, frame.next_child
             )
@@ -576,8 +573,6 @@ def _delete_sweep(
             stack[-1].ready.append(frame.path)
             continue
 
-        if _deadline_reached(deadline):
-            return retained_branches, True
         outcomes = _delete_candidates_with_progress_log(
             zk, root_path, [frame.path], progress
         )
@@ -601,18 +596,11 @@ def _delete_atomic(
     return True
 
 
-def _validate_delete_limits(max_sweeps: int, delete_timeout: Optional[float]) -> None:
-    if max_sweeps < 0:
-        raise ValueError("max_sweeps must be non-negative")
-    if delete_timeout is not None and delete_timeout <= 0:
-        raise ValueError("delete_timeout must be positive")
-
-
 def delete_recursive(
     zk: KazooClient,
     paths: List[str],
     dry_run: bool = False,
-    max_sweeps: int = DEFAULT_DELETE_MAX_SWEEPS,
+    max_sweeps: int = 3,
     delete_timeout: Optional[float] = None,
 ) -> None:
     """
@@ -622,25 +610,45 @@ def delete_recursive(
     bounded sibling batches and discover only candidates reported as nonempty.
     Concurrently changed branches are retained for a later finite sweep.
     """
+    # pylint: disable=too-many-branches
 
     if len(paths) == 0:
         return
-    _validate_delete_limits(max_sweeps, delete_timeout)
+    if max_sweeps < 0:
+        raise ValueError("max_sweeps must be non-negative")
+    if delete_timeout is not None and delete_timeout <= 0:
+        raise ValueError("delete_timeout must be positive")
 
     deadline = monotonic() + delete_timeout if delete_timeout is not None else None
 
     logging.debug("Node to recursive delete {}", paths)
     paths = remove_subpaths(paths)
     if dry_run:
-        dry_run_nodes = []
+        node_count = 0
+        dry_run_nodes: Optional[List[str]] = []
         for path in paths:
-            dry_run_nodes.extend(_collect_nodes_up_to(zk, path) or [])
-        logging.info("Got {} nodes to remove.", len(dry_run_nodes))
-        logging.info("Would delete nodes: {}", dry_run_nodes)
+            for node in _walk_subtree_depth_first(zk, path):
+                node_count += 1
+                if dry_run_nodes is not None:
+                    if len(dry_run_nodes) < RECURSIVE_DELETE_DRY_RUN_MAX_LISTED_PATHS:
+                        dry_run_nodes.append(node)
+                    else:
+                        dry_run_nodes = None
+        logging.info("Got {} nodes to remove.", node_count)
+        if dry_run_nodes is None:
+            logging.info(
+                "Would delete {} nodes; path list omitted because it exceeds "
+                "{} entries",
+                node_count,
+                RECURSIVE_DELETE_DRY_RUN_MAX_LISTED_PATHS,
+            )
+        else:
+            logging.info("Would delete nodes: {}", dry_run_nodes)
         return
 
     for root_path in paths:
-        if zk.exists(root_path) is None:
+        root_stat = zk.exists(root_path)
+        if root_stat is None:
             logging.info(
                 "Recursive ZooKeeper deletion of {} completed: root already absent",
                 root_path,
@@ -649,13 +657,21 @@ def delete_recursive(
 
         progress = _DeleteProgress()
         try:
-            probe = _probe_subtree(zk, root_path, deadline)
+            if root_stat.children_count >= RECURSIVE_DELETE_TRANSACTION_MAX_OPS:
+                probe = _ProbeResult(None)
+            else:
+                probe = _probe_subtree(zk, root_path, deadline)
             if probe.deadline_reached:
                 raise RuntimeError(
                     f"Recursive deletion of {root_path} is incomplete: "
                     "delete deadline reached"
                 )
-            if probe.postorder is not None and not _deadline_reached(deadline):
+            if deadline is not None and monotonic() >= deadline:
+                raise RuntimeError(
+                    f"Recursive deletion of {root_path} is incomplete: "
+                    "delete deadline reached"
+                )
+            if probe.postorder is not None:
                 logging.info(
                     "Using atomic recursive ZooKeeper deletion for {}: nodes={}",
                     root_path,
@@ -680,22 +696,21 @@ def delete_recursive(
                     "switching to large mode",
                     root_path,
                 )
-            else:
-                logging.info(
-                    "Using large recursive ZooKeeper deletion for {}: "
-                    "max_multi_ops={}, max_multi_bytes={}, max_sweeps={}",
-                    root_path,
-                    MAX_MULTI_OPS,
-                    MAX_MULTI_BYTES,
-                    max_sweeps,
-                )
+
+            logging.info(
+                "Using large recursive ZooKeeper deletion for {}: "
+                "transaction_max_ops={}, transaction_max_bytes={}, max_sweeps={}",
+                root_path,
+                RECURSIVE_DELETE_TRANSACTION_MAX_OPS,
+                RECURSIVE_DELETE_TRANSACTION_MAX_BYTES,
+                max_sweeps,
+            )
 
             sweeps = 0
-            cached_children = probe.children
             while True:
                 sweeps += 1
                 retained, deadline_reached = _delete_sweep(
-                    zk, root_path, progress, cached_children, deadline
+                    zk, root_path, progress, deadline
                 )
                 progress.sweeps = sweeps
                 progress.retained_branches = retained
@@ -712,7 +727,9 @@ def delete_recursive(
                 )
                 if not root_exists:
                     break
-                if deadline_reached or _deadline_reached(deadline):
+                if deadline_reached or (
+                    deadline is not None and monotonic() >= deadline
+                ):
                     raise RuntimeError(
                         f"Recursive deletion of {root_path} is incomplete: "
                         "delete deadline reached"
@@ -722,7 +739,6 @@ def delete_recursive(
                         f"Recursive deletion of {root_path} is incomplete after "
                         f"{sweeps} sweeps: root still exists"
                     )
-                cached_children = {}
         except Exception:
             logging.error(
                 "Recursive ZooKeeper deletion of {} is incomplete: "

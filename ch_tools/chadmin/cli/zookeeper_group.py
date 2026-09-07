@@ -28,7 +28,6 @@ from ch_tools.chadmin.internal.table_replica import (
 from ch_tools.chadmin.internal.utils import chunked
 from ch_tools.chadmin.internal.zero_copy import generate_zero_copy_lock_tasks
 from ch_tools.chadmin.internal.zookeeper import (
-    DEFAULT_DELETE_MAX_SWEEPS,
     check_zk_node,
     create_zk_nodes,
     delete_zk_nodes,
@@ -282,7 +281,7 @@ def update_command(
 @option(
     "--max-sweeps",
     type=IntRange(min=0),
-    default=DEFAULT_DELETE_MAX_SWEEPS,
+    default=3,
     show_default=True,
     help="Maximum deletion sweeps; 0 retries until completion.",
 )
