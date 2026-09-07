@@ -433,10 +433,14 @@ def remove_subpaths(paths: List[str]) -> List[str]:
 
 @dataclass
 class _DeleteFrame:
+    """Discovery state for one node; pending work belongs to one sibling batch."""
+
     path: str
     children: Optional[List[str]] = None
     next_child: int = 0
+    # Children that rejected deletion and still need their descendants visited.
     to_expand: List[str] = field(default_factory=list)
+    # Visited children awaiting another deletion attempt, grouped at their parent.
     ready: List[str] = field(default_factory=list)
     retained: bool = False
 
@@ -465,6 +469,11 @@ def _walk_subtree_depth_first(
 def _take_child_batch(
     parent: str, children: List[str], start: int
 ) -> tuple[List[str], int]:
+    """Build a sibling batch and return the next unread child index.
+
+    A path exceeding the byte limit is emitted alone so traversal can advance;
+    _delete_candidates handles it with an individual delete instead of multi.
+    """
     batch: List[str] = []
     estimated_bytes = 0
     index = start
@@ -513,7 +522,11 @@ def _delete_sweep(
     progress: _DeleteProgress,
     deadline: Optional[float] = None,
 ) -> tuple[int, bool]:
-    """Run one finite sweep; return retained branch count and deadline state."""
+    """Run one depth-first sweep; return retained branch count and deadline state.
+
+    Count final NOT_EMPTY results, including the root, rather than all surviving
+    nodes or skipped ancestors. Update progress for every completed deletion.
+    """
     stack = [_DeleteFrame(root_path)]
     retained_branches = 0
 
@@ -524,6 +537,8 @@ def _delete_sweep(
         frame = stack[-1]
 
         if frame.children is None:
+            # ZooKeeper returns the complete child list; batch limits cannot
+            # bound this allocation.
             frame.children = get_children(zk, frame.path)
             continue
 
@@ -532,6 +547,8 @@ def _delete_sweep(
             continue
 
         if frame.ready:
+            # Writers may have added children since discovery. Defer another
+            # discovery to the next sweep so this retry cannot loop forever.
             not_empty_indices = _delete_candidates_with_progress_log(
                 zk, root_path, frame.ready, progress
             )
@@ -542,6 +559,7 @@ def _delete_sweep(
             continue
 
         if frame.next_child < len(frame.children):
+            # Optimistically delete leaves without a get_children call per leaf.
             batch, frame.next_child = _take_child_batch(
                 frame.path, frame.children, frame.next_child
             )
@@ -553,6 +571,8 @@ def _delete_sweep(
 
         stack.pop()
         if frame.retained:
+            # A surviving descendant prevents deletion of this node and all
+            # its ancestors. Propagate that fact, not a skip of sibling work.
             if stack:
                 stack[-1].retained = True
             continue
@@ -580,6 +600,28 @@ def _delete_atomic(
         return False
     progress.counts.deleted += len(paths)
     return True
+
+
+def _dry_run_delete_recursive(zk: KazooClient, paths: List[str]) -> None:
+    node_count = 0
+    dry_run_nodes: Optional[List[str]] = []
+    for path in paths:
+        for node in _walk_subtree_depth_first(zk, path):
+            node_count += 1
+            if dry_run_nodes is not None:
+                if len(dry_run_nodes) < RECURSIVE_DELETE_DRY_RUN_MAX_LISTED_PATHS:
+                    dry_run_nodes.append(node)
+                else:
+                    dry_run_nodes = None
+    logging.info("Got {} nodes to remove.", node_count)
+    if dry_run_nodes is None:
+        logging.info(
+            "Would delete {} nodes; path list omitted because it exceeds " "{} entries",
+            node_count,
+            RECURSIVE_DELETE_DRY_RUN_MAX_LISTED_PATHS,
+        )
+    else:
+        logging.info("Would delete nodes: {}", dry_run_nodes)
 
 
 def delete_recursive(
@@ -610,26 +652,7 @@ def delete_recursive(
     logging.debug("Node to recursive delete {}", paths)
     paths = remove_subpaths(paths)
     if dry_run:
-        node_count = 0
-        dry_run_nodes: Optional[List[str]] = []
-        for path in paths:
-            for node in _walk_subtree_depth_first(zk, path):
-                node_count += 1
-                if dry_run_nodes is not None:
-                    if len(dry_run_nodes) < RECURSIVE_DELETE_DRY_RUN_MAX_LISTED_PATHS:
-                        dry_run_nodes.append(node)
-                    else:
-                        dry_run_nodes = None
-        logging.info("Got {} nodes to remove.", node_count)
-        if dry_run_nodes is None:
-            logging.info(
-                "Would delete {} nodes; path list omitted because it exceeds "
-                "{} entries",
-                node_count,
-                RECURSIVE_DELETE_DRY_RUN_MAX_LISTED_PATHS,
-            )
-        else:
-            logging.info("Would delete nodes: {}", dry_run_nodes)
+        _dry_run_delete_recursive(zk, paths)
         return
 
     for root_path in paths:
